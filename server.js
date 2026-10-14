@@ -138,7 +138,7 @@ function registrarAuditoria({ orgId, user, entidade, entidadeId, entidadeNome, a
     (org_id, usuario_id, usuario_nome, entidade, entidade_id, entidade_nome, acao, valor_antigo, valor_novo)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(orgId, user.id, user.nome, entidade, entidadeId, entidadeNome || '',
-         acao, JSON.stringify(valorAntigo ?? null), JSON.stringify(valorNovo ?? null));
+      acao, JSON.stringify(valorAntigo ?? null), JSON.stringify(valorNovo ?? null));
 }
 
 
@@ -166,16 +166,18 @@ app.post('/api/auth/login', (req, res) => {
     return res.status(401).json({ erro: 'Usuário ou senha inválidos' });
   }
   const token = jwt.sign({ id: u.id }, JWT_SECRET, { expiresIn: '7d' });
+  const orgCfg = u.org_id
+    ? db.prepare(`SELECT mostrar_subs_classificacao, modo_publico, esconder_pontos_podio
+                  FROM organizacoes WHERE id = ?`).get(u.org_id)
+    : null;
   res.json({
     token,
     usuario: {
       id: u.id, usuario: u.usuario, nome: u.nome, papel: u.papel,
       orgId: u.org_id, orgNome: u.org_nome, orgSlug: u.org_slug,
-      orgMostrarSubs: (() => {
-        if (!u.org_id) return true;
-        const o = db.prepare('SELECT mostrar_subs_classificacao AS m FROM organizacoes WHERE id = ?').get(u.org_id);
-        return o ? !!o.m : true;
-      })()
+      orgMostrarSubs: orgCfg ? !!orgCfg.mostrar_subs_classificacao : true,
+      modoPublico: orgCfg?.modo_publico || 'competicoes_classificacao_com_pts',
+      esconderPontosPodio: orgCfg ? !!orgCfg.esconder_pontos_podio : false
     }
   });
 });
@@ -189,11 +191,15 @@ app.post('/api/auth/login', (req, res) => {
  */
 app.get('/api/me', auth, (req, res) => {
   const org = req.user.org_id
-    ? db.prepare('SELECT id, nome, slug, cor, emoji, mostrar_subs_classificacao FROM organizacoes WHERE id = ?').get(req.user.org_id)
+    ? db.prepare(`SELECT id, nome, slug, cor, emoji, mostrar_subs_classificacao,
+                         modo_publico, esconder_pontos_podio
+                  FROM organizacoes WHERE id = ?`).get(req.user.org_id)
     : null;
   res.json({
     ...req.user,
     orgMostrarSubs: org ? !!org.mostrar_subs_classificacao : true,
+    modoPublico: org?.modo_publico || 'competicoes_classificacao_com_pts',
+    esconderPontosPodio: org ? !!org.esconder_pontos_podio : false,
     org
   });
 });
@@ -251,6 +257,46 @@ app.put('/api/minha-org/mostrar-subs', auth, (req, res) => {
   res.json({ ok: true, mostrarSubs: !!mostrarSubs });
 });
 
+/* PUT /api/minha-org/config-publica
+   ------------------------------------------------------------
+   Atualiza as duas configurações de exibição pública:
+     - modoPublico: 'competicoes' | 'competicoes_classificacao_com_pts'
+                    | 'competicoes_classificacao_sem_pts'
+     - esconderPontosPodio: boolean
+*/
+app.put('/api/minha-org/config-publica', auth, (req, res) => {
+  const orgId = req.user.org_id;
+  if (!orgId) return res.status(400).json({ erro: 'Usuário sem organização' });
+
+  const { modoPublico, esconderPontosPodio } = req.body || {};
+
+  const modoValidos = [
+    'competicoes',
+    'competicoes_classificacao_com_pts',
+    'competicoes_classificacao_sem_pts'
+  ];
+
+  const campos = [];
+  const valores = [];
+
+  if (modoPublico !== undefined) {
+    if (!modoValidos.includes(modoPublico)) {
+      return res.status(400).json({ erro: 'Modo público inválido' });
+    }
+    campos.push('modo_publico = ?');
+    valores.push(modoPublico);
+  }
+  if (esconderPontosPodio !== undefined) {
+    campos.push('esconder_pontos_podio = ?');
+    valores.push(esconderPontosPodio ? 1 : 0);
+  }
+  if (!campos.length) return res.status(400).json({ erro: 'Nada para atualizar' });
+
+  valores.push(orgId);
+  db.prepare(`UPDATE organizacoes SET ${campos.join(', ')} WHERE id = ?`).run(...valores);
+  res.json({ ok: true });
+});
+
 
 // ============================================================
 // ROTAS PÚBLICAS (SEM LOGIN)
@@ -292,12 +338,14 @@ app.get('/api/publico/orgs', (req, res) => {
  */
 app.get('/api/publico/orgs/:slug', (req, res) => {
   // 1. Busca a organização pelo slug
-    const org = db.prepare('SELECT id, nome, slug, cor, emoji, imagem, mostrar_subs_classificacao FROM organizacoes WHERE slug = ? AND ativo = 1').get(req.params.slug);
+  const org = db.prepare(`SELECT id, nome, slug, cor, emoji, imagem,
+                            mostrar_subs_classificacao, modo_publico, esconder_pontos_podio
+                            FROM organizacoes WHERE slug = ? AND ativo = 1`).get(req.params.slug);
   if (!org) return res.status(404).json({ erro: 'Organização não encontrada' });
 
   // 2. Busca os dados da org (apenas não-secretos)
   const equipes = db.prepare(
-  'SELECT id, nome, responsavel, equipe_pai_id FROM equipes WHERE org_id = ? ORDER BY nome').all(org.id);
+    'SELECT id, nome, responsavel, equipe_pai_id FROM equipes WHERE org_id = ? ORDER BY nome').all(org.id);
   const jogos = db.prepare('SELECT * FROM jogos WHERE org_id = ? AND secreto = 0 ORDER BY nome').all(org.id);
   const penalidades = db.prepare('SELECT equipe_id, pontos FROM penalidades WHERE org_id = ?').all(org.id);
   const competicoes = db.prepare('SELECT * FROM competicoes WHERE org_id = ? AND secreto = 0').all(org.id);
@@ -323,64 +371,64 @@ app.get('/api/publico/orgs/:slug', (req, res) => {
   // 5. Soma pontos das competições (mata-mata e grupos)
   // 5. Soma pontos das competições
   competicoes.forEach(c => {
-  const partidas = db.prepare('SELECT * FROM competicoes_partidas WHERE competicao_id = ? ORDER BY rodada, posicao').all(c.id);
+    const partidas = db.prepare('SELECT * FROM competicoes_partidas WHERE competicao_id = ? ORDER BY rodada, posicao').all(c.id);
 
-  // -------- Personalizado --------
-  if (c.tipo === 'personalizado') {
-    const blocos = db.prepare('SELECT * FROM competicoes_blocos WHERE competicao_id = ?').all(c.id);
-    const blocoFinal = blocos.find(b => b.eh_final);
-    const blocoTerceiro = blocos.find(b => b.eh_terceiro);
+    // -------- Personalizado --------
+    if (c.tipo === 'personalizado') {
+      const blocos = db.prepare('SELECT * FROM competicoes_blocos WHERE competicao_id = ?').all(c.id);
+      const blocoFinal = blocos.find(b => b.eh_final);
+      const blocoTerceiro = blocos.find(b => b.eh_terceiro);
 
-    if (blocoFinal) {
-      const finais = partidas
-        .filter(p => p.bloco_id === blocoFinal.id && p.vencedor && p.equipe_a && p.equipe_b)
-        .sort((a, b) => (b.posicao || 0) - (a.posicao || 0));
-      const final = finais[0];
-      if (final) {
-        const perd = final.vencedor === final.equipe_a ? final.equipe_b : final.equipe_a;
-        const v = mapa.get(final.vencedor);
-        const p2 = mapa.get(perd);
-        if (v) v.pontos += Number(c.pontos_1) || 0;
-        if (p2) p2.pontos += Number(c.pontos_2) || 0;
+      if (blocoFinal) {
+        const finais = partidas
+          .filter(p => p.bloco_id === blocoFinal.id && p.vencedor && p.equipe_a && p.equipe_b)
+          .sort((a, b) => (b.posicao || 0) - (a.posicao || 0));
+        const final = finais[0];
+        if (final) {
+          const perd = final.vencedor === final.equipe_a ? final.equipe_b : final.equipe_a;
+          const v = mapa.get(final.vencedor);
+          const p2 = mapa.get(perd);
+          if (v) v.pontos += Number(c.pontos_1) || 0;
+          if (p2) p2.pontos += Number(c.pontos_2) || 0;
+        }
       }
-    }
-        // 3º manual tem prioridade sobre o bloco (só um dos dois conta).
-    const cfgLocalP = (() => { try { return JSON.parse(c.config_json || '{}'); } catch { return {}; } })();
-    if (cfgLocalP.terceiroColocado) {
-      const t3 = mapa.get(cfgLocalP.terceiroColocado);
-      if (t3) t3.pontos += Number(c.pontos_3) || 0;
-    } else if (blocoTerceiro) {
-      const terceiros = partidas
-        .filter(p => p.bloco_id === blocoTerceiro.id && p.vencedor)
-        .sort((a, b) => (b.posicao || 0) - (a.posicao || 0));
-      const terc = terceiros[0];
-      if (terc) {
-        const t3 = mapa.get(terc.vencedor);
+      // 3º manual tem prioridade sobre o bloco (só um dos dois conta).
+      const cfgLocalP = (() => { try { return JSON.parse(c.config_json || '{}'); } catch { return {}; } })();
+      if (cfgLocalP.terceiroColocado) {
+        const t3 = mapa.get(cfgLocalP.terceiroColocado);
         if (t3) t3.pontos += Number(c.pontos_3) || 0;
+      } else if (blocoTerceiro) {
+        const terceiros = partidas
+          .filter(p => p.bloco_id === blocoTerceiro.id && p.vencedor)
+          .sort((a, b) => (b.posicao || 0) - (a.posicao || 0));
+        const terc = terceiros[0];
+        if (terc) {
+          const t3 = mapa.get(terc.vencedor);
+          if (t3) t3.pontos += Number(c.pontos_3) || 0;
+        }
       }
+      return;
     }
-    return;
-  }
 
-  // -------- Mata-mata e grupos + mata-mata --------
-  const principais = partidas.filter(p => !p.is_terceiro && !p.grupo);
-  const terc = partidas.find(p => p.is_terceiro && !p.grupo);
-  if (!principais.length) return;
-  const maxR = Math.max(...principais.map(p => p.rodada));
-  const final = principais.find(p => p.rodada === maxR && p.vencedor && p.equipe_a && p.equipe_b);
-  if (final) {
-    const perd = final.vencedor === final.equipe_a ? final.equipe_b : final.equipe_a;
-    const v = mapa.get(final.vencedor);
-    const p2 = mapa.get(perd);
-    if (v) v.pontos += Number(c.pontos_1) || 0;
-    if (p2) p2.pontos += Number(c.pontos_2) || 0;
-  }
-  // NOVO — prioriza o 3º manual
+    // -------- Mata-mata e grupos + mata-mata --------
+    const principais = partidas.filter(p => !p.is_terceiro && !p.grupo);
+    const terc = partidas.find(p => p.is_terceiro && !p.grupo);
+    if (!principais.length) return;
+    const maxR = Math.max(...principais.map(p => p.rodada));
+    const final = principais.find(p => p.rodada === maxR && p.vencedor && p.equipe_a && p.equipe_b);
+    if (final) {
+      const perd = final.vencedor === final.equipe_a ? final.equipe_b : final.equipe_a;
+      const v = mapa.get(final.vencedor);
+      const p2 = mapa.get(perd);
+      if (v) v.pontos += Number(c.pontos_1) || 0;
+      if (p2) p2.pontos += Number(c.pontos_2) || 0;
+    }
+    // NOVO — prioriza o 3º manual
     let terceiroId = '';
     try {
       const cfgC = JSON.parse(c.config_json || '{}');
       terceiroId = cfgC.terceiroColocado || '';
-    } catch {}
+    } catch { }
     if (!terceiroId && terc && terc.vencedor) terceiroId = terc.vencedor;
 
     if (terceiroId) {
@@ -395,7 +443,7 @@ app.get('/api/publico/orgs/:slug', (req, res) => {
     if (item) item.penal += Number(p.pontos) || 0;
   });
 
-    // 7. Consolida classificação (raiz + sub-equipes)
+  // 7. Consolida classificação (raiz + sub-equipes)
   const stats = new Map();
   mapa.forEach((v, id) => {
     stats.set(id, { pontos: v.pontos, penal: v.penal, jogos: 0 });
@@ -419,9 +467,11 @@ app.get('/api/publico/orgs/:slug', (req, res) => {
       cor: org.cor,
       emoji: org.emoji,
       imagem: org.imagem,
-      mostrarSubs: !!org.mostrar_subs_classificacao
+      mostrarSubs: !!org.mostrar_subs_classificacao,
+      modoPublico: org.modo_publico || 'competicoes_classificacao_com_pts',
+      esconderPontosPodio: !!org.esconder_pontos_podio
     },
-      equipes: equipes.map(e => ({
+    equipes: equipes.map(e => ({
       id: e.id,
       nome: e.nome,
       equipePaiId: e.equipe_pai_id || ''
@@ -434,26 +484,27 @@ app.get('/api/publico/orgs/:slug', (req, res) => {
       resultados: JSON.parse(j.resultados_json || '{}')
     })),
     competicoes: competicoes.map(c => {
-  let cfg = {};
-  try { cfg = JSON.parse(c.config_json || '{}'); } catch {}
-  const todas = ptStmt.all(c.id).map(p => ({
-    id: p.id, rodada: p.rodada, posicao: p.posicao,
-    equipeA: p.equipe_a || '', equipeB: p.equipe_b || '',
-    vencedor: p.vencedor || '', isTerceiro: !!p.is_terceiro,
-    grupo: p.grupo || '', blocoId: p.bloco_id || '',
-    golsA: (p.gols_a === null || p.gols_a === undefined) ? null : p.gols_a,
-    golsB: (p.gols_b === null || p.gols_b === undefined) ? null : p.gols_b
-  }));
-
-  let blocos = null;
-  if (c.tipo === 'personalizado') {
-    blocos = db.prepare('SELECT * FROM competicoes_blocos WHERE competicao_id = ? ORDER BY ordem').all(c.id)
-      .map(b => ({
-        id: b.id, nome: b.nome, tipo: b.tipo, ordem: b.ordem,
-        ehFinal: !!b.eh_final, ehTerceiro: !!b.eh_terceiro,
-        config: (() => { try { return JSON.parse(b.config_json || '{}'); } catch { return {}; } })()
+      let cfg = {};
+      try { cfg = JSON.parse(c.config_json || '{}'); } catch { }
+      const todas = ptStmt.all(c.id).map(p => ({
+        id: p.id, rodada: p.rodada, posicao: p.posicao,
+        equipeA: p.equipe_a || '', equipeB: p.equipe_b || '',
+        vencedor: p.vencedor || '', isTerceiro: !!p.is_terceiro,
+        grupo: p.grupo || '', blocoId: p.bloco_id || '',
+        horario: p.horario || '',
+        golsA: (p.gols_a === null || p.gols_a === undefined) ? null : p.gols_a,
+        golsB: (p.gols_b === null || p.gols_b === undefined) ? null : p.gols_b
       }));
-  }
+
+      let blocos = null;
+      if (c.tipo === 'personalizado') {
+        blocos = db.prepare('SELECT * FROM competicoes_blocos WHERE competicao_id = ? ORDER BY ordem').all(c.id)
+          .map(b => ({
+            id: b.id, nome: b.nome, tipo: b.tipo, ordem: b.ordem,
+            ehFinal: !!b.eh_final, ehTerceiro: !!b.eh_terceiro,
+            config: (() => { try { return JSON.parse(b.config_json || '{}'); } catch { return {}; } })()
+          }));
+      }
 
       // Se for grupos_mata_mata, calcula a classificação de cada grupo
       let gruposOut = null;
@@ -536,7 +587,7 @@ app.put('/api/orgs/:id', auth, exigirPapel('admin_geral'), (req, res) => {
   if (!org) return res.status(404).json({ erro: 'Organização não encontrada' });
   db.prepare('UPDATE organizacoes SET nome=?, cor=?, emoji=?, ativo=? WHERE id=?')
     .run(nome?.trim() || org.nome, cor ?? org.cor, emoji ?? org.emoji,
-         ativo === undefined ? org.ativo : (ativo ? 1 : 0), req.params.id);
+      ativo === undefined ? org.ativo : (ativo ? 1 : 0), req.params.id);
   res.json(db.prepare('SELECT * FROM organizacoes WHERE id = ?').get(req.params.id));
 });
 
@@ -767,8 +818,24 @@ app.post('/api/jogos', auth, bloquearAdminGeral, (req, res) => {
   db.prepare(`INSERT INTO jogos (id, org_id, nome, secreto, posicoes_json, participantes_json)
               VALUES (?, ?, ?, ?, ?, ?)`)
     .run(id, orgId, nome.trim(), secreto ? 1 : 0,
-         JSON.stringify(posicoes || []), JSON.stringify(participantes || []));
+      JSON.stringify(posicoes || []), JSON.stringify(participantes || []));
   res.status(201).json(mapJogo(db.prepare('SELECT * FROM jogos WHERE id = ?').get(id)));
+});
+
+// Revelar TODOS os jogos secretos da org de uma vez
+app.put('/api/jogos/revelar-todos', auth, bloquearAdminGeral, exigirPapel('responsavel'), (req, res) => {
+  const orgId = req.user.papel === 'admin_geral' ? (req.body.orgId || req.user.org_id) : req.user.org_id;
+  if (!orgId) return res.status(400).json({ erro: 'Organização não definida' });
+  const r = db.prepare('UPDATE jogos SET secreto=0 WHERE org_id=? AND secreto=1').run(orgId);
+  res.json({ ok: true, revelados: r.changes });
+});
+
+// Esconder TODOS os jogos da org
+app.put('/api/jogos/esconder-todos', auth, bloquearAdminGeral, exigirPapel('responsavel'), (req, res) => {
+  const orgId = req.user.org_id;
+  if (!orgId) return res.status(400).json({ erro: 'Organização não definida' });
+  const r = db.prepare('UPDATE jogos SET secreto=1 WHERE org_id=? AND secreto=0').run(orgId);
+  res.json({ ok: true, escondidos: r.changes });
 });
 
 app.put('/api/jogos/:id', auth, bloquearAdminGeral, (req, res) => {
@@ -791,7 +858,7 @@ app.put('/api/jogos/:id', auth, bloquearAdminGeral, (req, res) => {
 
   db.prepare(`UPDATE jogos SET nome=?, posicoes_json=?, participantes_json=?, resultados_json=?, secreto=? WHERE id=?`)
     .run(nome.trim(), JSON.stringify(novasPos), JSON.stringify(novosPart),
-         JSON.stringify(resuFinal), secreto ? 1 : 0, req.params.id);
+      JSON.stringify(resuFinal), secreto ? 1 : 0, req.params.id);
   res.json(mapJogo(db.prepare('SELECT * FROM jogos WHERE id = ?').get(req.params.id)));
 });
 
@@ -832,13 +899,6 @@ app.put('/api/jogos/:id/revelar', auth, bloquearAdminGeral, exigirPapel('respons
   res.json({ ok: true });
 });
 
-// Revelar TODOS os jogos secretos da org de uma vez
-app.put('/api/jogos/revelar-todos', auth, bloquearAdminGeral, exigirPapel('responsavel'), (req, res) => {
-  const orgId = req.user.papel === 'admin_geral' ? (req.body.orgId || req.user.org_id) : req.user.org_id;
-  if (!orgId) return res.status(400).json({ erro: 'Organização não definida' });
-  const r = db.prepare('UPDATE jogos SET secreto=0 WHERE org_id=? AND secreto=1').run(orgId);
-  res.json({ ok: true, revelados: r.changes });
-});
 
 app.delete('/api/jogos/:id', auth, bloquearAdminGeral, exigirPapel('responsavel'), (req, res) => {
   const j = db.prepare('SELECT * FROM jogos WHERE id = ?').get(req.params.id);
@@ -918,6 +978,7 @@ function mapPartida(row) {
     isTerceiro: !!row.is_terceiro,
     grupo: row.grupo || '',
     blocoId: row.bloco_id || '',
+    horario: row.horario || '',
     golsA: (row.gols_a === null || row.gols_a === undefined) ? null : row.gols_a,
     golsB: (row.gols_b === null || row.gols_b === undefined) ? null : row.gols_b
   };
@@ -993,7 +1054,7 @@ function consolidarClassificacao(equipes, mapaIdParaStats) {
  */
 function mapCompeticao(row, partidas) {
   let cfg = {};
-  try { cfg = JSON.parse(row.config_json || '{}'); } catch {}
+  try { cfg = JSON.parse(row.config_json || '{}'); } catch { }
   return {
     id: row.id,
     org_id: row.org_id,
@@ -1011,41 +1072,94 @@ function mapCompeticao(row, partidas) {
   };
 }
 
-/**
- * `gerarChave(equipesIds)` — geração de chave mata-mata
- * ------------------------------------------------------------
- * 1. Embaralha as equipes (Fisher-Yates)
- * 2. Na primeira rodada, pareia 2 a 2 na ordem
- * 3. Se o número for ímpar, o último ganha um "bye" (vencedor automático)
- * 4. Cria as rodadas seguintes vazias (semi, final...)
- * 5. Adiciona 1 partida extra para a disputa de 3º lugar
- */
+/* ============================================================
+   gerarChave(equipesIds)
+   ------------------------------------------------------------
+   Gera uma chave de eliminação simples com byes, seguindo a
+   mesma regra do montar-chave:
+
+     Q            = menor potência de 2 ≥ N
+     numByes      = Q - N
+     numMatchups  = Q / 2            (slots na rodada 1)
+     numConfrontos = Q/2 - numByes   (jogos reais na rodada 1)
+
+   Rodada 1 fica intercalada: match, bye, match, bye, ...
+   Rodadas seguintes: Q/4, Q/8, ..., 1.
+
+   Ex.: N=5 → Q=8, 3 byes, 1 confronto real
+        N=8 → Q=8, 0 byes, 4 confrontos
+   ============================================================ */
 function gerarChave(equipesIds) {
   const arr = [...equipesIds];
+
   // Fisher-Yates shuffle
   for (let i = arr.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
     [arr[i], arr[j]] = [arr[j], arr[i]];
   }
+
+  const N = arr.length;
+  if (N < 2) return [];
+
+  // Próxima potência de 2 ≥ N
+  let Q = 1;
+  while (Q < N) Q *= 2;
+  const numByes = Q - N;
+  const numMatchups = Q / 2;
+  const numConfrontos = numMatchups - numByes;
+
+  // Distribui byes entre os primeiros (embaralhados) e o resto joga
+  const byes = arr.slice(0, numByes);
+  const jogam = arr.slice(numByes);
+
+  // ---------- Rodada 1: intercalando match/bye ----------
   const todas = [];
-  let timesRodada = [...arr];
-  let rodada = 1;
-  while (timesRodada.length > 1) {
-    const qtd = Math.ceil(timesRodada.length / 2);
-    for (let i = 0; i < qtd; i++) {
-      const a = timesRodada[i * 2] || '';
-      const b = timesRodada[i * 2 + 1] || '';
-      // Se só tem um time, ele já é o vencedor (bye)
-      const venc = (a && !b) ? a : (!a && b) ? b : '';
-      todas.push({ rodada, posicao: i, equipe_a: a, equipe_b: b, vencedor: venc, is_terceiro: 0 });
+  let mi = 0, bi = 0, pos = 0;
+  while (mi < numConfrontos || bi < numByes) {
+    if (mi < numConfrontos) {
+      todas.push({
+        rodada: 1, posicao: pos++,
+        equipe_a: jogam[mi * 2],
+        equipe_b: jogam[mi * 2 + 1],
+        vencedor: '', is_terceiro: 0
+      });
+      mi++;
     }
-    timesRodada = new Array(qtd).fill('');
+    if (bi < numByes) {
+      todas.push({
+        rodada: 1, posicao: pos++,
+        equipe_a: byes[bi], equipe_b: '',
+        vencedor: byes[bi], is_terceiro: 0
+      });
+      bi++;
+    }
+  }
+
+  // ---------- Rodadas seguintes (vazias): Q/4, Q/8, ..., 1 ----------
+  let slots = numMatchups;      // = Q/2
+  let rodada = 2;
+  while (slots > 1) {
+    const prox = slots / 2;
+    for (let i = 0; i < prox; i++) {
+      todas.push({
+        rodada, posicao: i,
+        equipe_a: '', equipe_b: '',
+        vencedor: '', is_terceiro: 0
+      });
+    }
+    slots = prox;
     rodada++;
   }
-  // Disputa de 3º lugar (só se tiver pelo menos 4 equipes)
-  if (arr.length >= 4) {
-    todas.push({ rodada, posicao: 0, equipe_a: '', equipe_b: '', vencedor: '', is_terceiro: 1 });
+
+  // ---------- Disputa de 3º lugar (a partir de 4 equipes) ----------
+  if (N >= 4) {
+    todas.push({
+      rodada, posicao: 0,
+      equipe_a: '', equipe_b: '',
+      vencedor: '', is_terceiro: 1
+    });
   }
+
   return todas;
 }
 
@@ -1405,8 +1519,8 @@ app.post('/api/competicoes', auth, bloquearAdminGeral, (req, res) => {
   const id = uid();
   const tipoFinal =
     tipo === 'grupos_mata_mata' ? 'grupos_mata_mata' :
-    tipo === 'personalizado'    ? 'personalizado' :
-                                  'mata_mata';
+      tipo === 'personalizado' ? 'personalizado' :
+        'mata_mata';
 
   // ============================================================
   // RAMO 1 — MATA-MATA SIMPLES
@@ -1418,7 +1532,7 @@ app.post('/api/competicoes', auth, bloquearAdminGeral, (req, res) => {
         (id, org_id, nome, tipo, secreto, equipes_json, pontos_1, pontos_2, pontos_3, config_json)
         VALUES (?, ?, ?, 'mata_mata', ?, ?, ?, ?, ?, '{}')`)
         .run(id, orgId, nome.trim(), secreto ? 1 : 0, JSON.stringify(equipes),
-             Number(pontos1) || 0, Number(pontos2) || 0, Number(pontos3) || 0);
+          Number(pontos1) || 0, Number(pontos2) || 0, Number(pontos3) || 0);
 
       const ins = db.prepare(`INSERT INTO competicoes_partidas
         (id, competicao_id, rodada, posicao, equipe_a, equipe_b, vencedor, is_terceiro)
@@ -1429,11 +1543,11 @@ app.post('/api/competicoes', auth, bloquearAdminGeral, (req, res) => {
     });
     tx();
 
-  // ============================================================
-  // RAMO 2 — GRUPOS + MATA-MATA
-  // ============================================================
+    // ============================================================
+    // RAMO 2 — GRUPOS + MATA-MATA
+    // ============================================================
   } else if (tipoFinal === 'grupos_mata_mata') {
-    const nG  = Math.max(2, Math.min(8, Number(numGrupos) || 2));
+    const nG = Math.max(2, Math.min(8, Number(numGrupos) || 2));
     const cPG = Math.max(1, Math.min(4, Number(classificadosPorGrupo) || 2));
 
     if (equipes.length < nG * 2) {
@@ -1447,7 +1561,7 @@ app.post('/api/competicoes', auth, bloquearAdminGeral, (req, res) => {
       numGrupos: nG,
       classificadosPorGrupo: cPG,
       pontosVitoria: Number(pontosVitoria) || 3,
-      pontosEmpate:  Number(pontosEmpate)  || 1,
+      pontosEmpate: Number(pontosEmpate) || 1,
       gruposGerados: true,
       mataMataGerado: false
     };
@@ -1457,8 +1571,8 @@ app.post('/api/competicoes', auth, bloquearAdminGeral, (req, res) => {
         (id, org_id, nome, tipo, secreto, equipes_json, pontos_1, pontos_2, pontos_3, config_json)
         VALUES (?, ?, ?, 'grupos_mata_mata', ?, ?, ?, ?, ?, ?)`)
         .run(id, orgId, nome.trim(), secreto ? 1 : 0, JSON.stringify(equipes),
-             Number(pontos1) || 0, Number(pontos2) || 0, Number(pontos3) || 0,
-             JSON.stringify(config));
+          Number(pontos1) || 0, Number(pontos2) || 0, Number(pontos3) || 0,
+          JSON.stringify(config));
 
       const ins = db.prepare(`INSERT INTO competicoes_partidas
         (id, competicao_id, rodada, posicao, equipe_a, equipe_b, vencedor, is_terceiro, grupo)
@@ -1476,19 +1590,19 @@ app.post('/api/competicoes', auth, bloquearAdminGeral, (req, res) => {
     });
     tx();
 
-  // ============================================================
-  // RAMO 3 — PERSONALIZADO (livre)
-  // ------------------------------------------------------------
-  // Nasce VAZIO. Só grava o registro base da competição.
-  // Blocos e partidas são criados depois, no editor de blocos
-  // (POST /api/competicoes/:id/blocos).
-  // ============================================================
+    // ============================================================
+    // RAMO 3 — PERSONALIZADO (livre)
+    // ------------------------------------------------------------
+    // Nasce VAZIO. Só grava o registro base da competição.
+    // Blocos e partidas são criados depois, no editor de blocos
+    // (POST /api/competicoes/:id/blocos).
+    // ============================================================
   } else if (tipoFinal === 'personalizado') {
     db.prepare(`INSERT INTO competicoes
       (id, org_id, nome, tipo, secreto, equipes_json, pontos_1, pontos_2, pontos_3, config_json)
       VALUES (?, ?, ?, 'personalizado', ?, ?, ?, ?, ?, '{}')`)
       .run(id, orgId, nome.trim(), secreto ? 1 : 0, JSON.stringify(equipes),
-           Number(pontos1) || 0, Number(pontos2) || 0, Number(pontos3) || 0);
+        Number(pontos1) || 0, Number(pontos2) || 0, Number(pontos3) || 0);
   }
 
   // ============================================================
@@ -1502,6 +1616,23 @@ app.post('/api/competicoes', auth, bloquearAdminGeral, (req, res) => {
   res.status(201).json(mapCompeticao(row, salvas));
 });
 
+// Revelar TODAS as competições da org
+app.put('/api/competicoes/revelar-todas', auth, bloquearAdminGeral, exigirPapel('responsavel'), (req, res) => {
+  const orgId = req.user.org_id;
+  if (!orgId) return res.status(400).json({ erro: 'Organização não definida' });
+  const r = db.prepare('UPDATE competicoes SET secreto=0 WHERE org_id=? AND secreto=1').run(orgId);
+  res.json({ ok: true, reveladas: r.changes });
+});
+
+// Esconder TODAS as competições da org
+app.put('/api/competicoes/esconder-todas', auth, bloquearAdminGeral, exigirPapel('responsavel'), (req, res) => {
+  const orgId = req.user.org_id;
+  if (!orgId) return res.status(400).json({ erro: 'Organização não definida' });
+  const r = db.prepare('UPDATE competicoes SET secreto=1 WHERE org_id=? AND secreto=0').run(orgId);
+  res.json({ ok: true, escondidas: r.changes });
+});
+
+
 /**
  * PUT /api/competicoes/:id — atualiza nome, pontos e flag secreto
  * Não altera o tipo nem as equipes.
@@ -1511,7 +1642,7 @@ app.put('/api/competicoes/:id', auth, bloquearAdminGeral, (req, res) => {
     nome, pontos1, pontos2, pontos3, secreto,
     numGrupos, classificadosPorGrupo, pontosVitoria, pontosEmpate,
     terceiroColocado,
-    equipes                         // ← NOVO
+    equipes
   } = req.body || {};
   if (!nome || !nome.trim()) return res.status(400).json({ erro: 'Nome é obrigatório' });
 
@@ -1531,10 +1662,10 @@ app.put('/api/competicoes/:id', auth, bloquearAdminGeral, (req, res) => {
   // ---------- Atualiza config_json ----------
   const cfgAtual = JSON.parse(atual.config_json || '{}');
   if (atual.tipo === 'grupos_mata_mata') {
-    if (numGrupos !== undefined)             cfgAtual.numGrupos = Math.max(2, Math.min(8, Number(numGrupos) || 2));
+    if (numGrupos !== undefined) cfgAtual.numGrupos = Math.max(2, Math.min(8, Number(numGrupos) || 2));
     if (classificadosPorGrupo !== undefined) cfgAtual.classificadosPorGrupo = Math.max(1, Math.min(4, Number(classificadosPorGrupo) || 2));
-    if (pontosVitoria !== undefined)         cfgAtual.pontosVitoria = Number(pontosVitoria) || 3;
-    if (pontosEmpate !== undefined)          cfgAtual.pontosEmpate  = Number(pontosEmpate)  || 1;
+    if (pontosVitoria !== undefined) cfgAtual.pontosVitoria = Number(pontosVitoria) || 3;
+    if (pontosEmpate !== undefined) cfgAtual.pontosEmpate = Number(pontosEmpate) || 1;
   }
   if (terceiroColocado !== undefined) {
     cfgAtual.terceiroColocado = String(terceiroColocado || '');
@@ -1550,7 +1681,7 @@ app.put('/api/competicoes/:id', auth, bloquearAdminGeral, (req, res) => {
       Number(pontos3) || 0,
       secreto ? 1 : 0,
       JSON.stringify(cfgAtual),
-      equipesFinal,                     // ← NOVO
+      equipesFinal,
       req.params.id
     );
 
@@ -1591,28 +1722,6 @@ app.post('/api/competicoes/:id/gerar-chave', auth, bloquearAdminGeral, (req, res
    Cria a chave do mata-mata a partir de confrontos definidos
    MANUALMENTE pelo admin (em vez de sorteados).
 
-   Body: { confrontos: [ { equipeA: 'id-x', equipeB: 'id-y' }, ... ] }
-
-   Apaga APENAS as partidas do mata-mata (grupo = ''); partidas
-   de fase de grupos ficam intactas.
-   ============================================================ */
-/* ============================================================
-   POST /api/competicoes/:id/montar-chave
-   ------------------------------------------------------------
-   Cria a chave do mata-mata a partir de confrontos definidos
-   MANUALMENTE pelo admin (em vez de sorteados).
-
-   Body: { confrontos: [ { equipeA: 'id-x', equipeB: 'id-y' }, ... ] }
-
-   Apaga APENAS as partidas do mata-mata (grupo = ''); partidas
-   de fase de grupos ficam intactas.
-   ============================================================ */
-/* ============================================================
-   POST /api/competicoes/:id/montar-chave
-   ------------------------------------------------------------
-   Cria a chave do mata-mata a partir de confrontos definidos
-   MANUALMENTE pelo admin (em vez de sorteados).
-
    Body:
      {
        confrontos: [ { equipeA, equipeB }, ... ],   // rodada 1 (play-in)
@@ -1641,16 +1750,50 @@ app.post('/api/competicoes/:id/montar-chave', auth, bloquearAdminGeral, (req, re
 
     if (!comp) return res.status(404).json({ erro: 'Competição não encontrada' });
 
-    const equipesInscritas = JSON.parse(comp.equipes_json || '[]');
-    const N = equipesInscritas.length;
+    // ---------- Quem entra na chave? ----------
+    // mata_mata         → todas as equipes inscritas
+    // grupos_mata_mata  → só os classificados de cada grupo
+    let equipesPermitidas;
+    if (comp.tipo === 'mata_mata') {
+      equipesPermitidas = JSON.parse(comp.equipes_json || '[]');
+    } else {
+      const cfgComp = JSON.parse(comp.config_json || '{}');
+      const nClass = cfgComp.classificadosPorGrupo || 2;
 
-    if (N < 2) return res.status(400).json({ erro: 'Precisa de ao menos 2 equipes' });
+      const todasPartidas = db.prepare(
+        'SELECT * FROM competicoes_partidas WHERE competicao_id = ?'
+      ).all(comp.id);
+      const gruposMatch = todasPartidas.filter(p => p.grupo);
+      const nomesGrupos = [...new Set(gruposMatch.map(p => p.grupo))].sort();
+
+      equipesPermitidas = [];
+      nomesGrupos.forEach(nome => {
+        const matches = gruposMatch.filter(p => p.grupo === nome);
+        const idsSet = new Set();
+        matches.forEach(m => { idsSet.add(m.equipe_a); idsSet.add(m.equipe_b); });
+        const ids = Array.from(idsSet).filter(Boolean);
+        const mapeadas = matches.map(m => ({
+          equipe_a: m.equipe_a, equipe_b: m.equipe_b,
+          gols_a: m.gols_a, gols_b: m.gols_b
+        }));
+        const classif = calcularClassificacaoGrupo(ids, mapeadas, cfgComp);
+        classif.slice(0, nClass).forEach(c => equipesPermitidas.push(c.equipeId));
+      });
+    }
+
+    const N = equipesPermitidas.length;
+    if (N < 2) {
+      return res.status(400).json({ erro: 'Precisa de ao menos 2 equipes classificadas' });
+    }
 
     // ---------- Calcula estrutura (byes + play-in) ----------
+    // Q = menor potência de 2 ≥ N
+    // numByes = Q - N  (avançam direto à 2ª fase)
+    // numConfrontos = (N - numByes) / 2  (jogos da 1ª fase)
     let Q = 1;
-    while (Q * 2 <= N) Q *= 2;
-    const numByes      = 2 * Q - N;
-    const numConfrontos = N - Q;
+    while (Q < N) Q *= 2;
+    const numByes = Q - N;
+    const numConfrontos = (N - numByes) / 2;
 
     const { confrontos = [], byes = [] } = req.body || {};
 
@@ -1658,7 +1801,7 @@ app.post('/api/competicoes/:id/montar-chave', auth, bloquearAdminGeral, (req, re
     if (confrontos.length !== numConfrontos) {
       return res.status(400).json({
         erro: `São esperados ${numConfrontos} confronto(s) preliminar(es)` +
-              (numByes ? ` e ${numByes} equipe(s) com bye` : '')
+          (numByes ? ` e ${numByes} equipe(s) com bye` : '')
       });
     }
     if (byes.length !== numByes) {
@@ -1674,9 +1817,10 @@ app.post('/api/competicoes/:id/montar-chave', auth, bloquearAdminGeral, (req, re
         return res.status(400).json({ erro: 'Preencha todos os confrontos' });
       if (cf.equipeA === cf.equipeB)
         return res.status(400).json({ erro: 'Uma equipe não pode enfrentar a si mesma' });
-      if (!equipesInscritas.includes(cf.equipeA) ||
-          !equipesInscritas.includes(cf.equipeB))
-        return res.status(400).json({ erro: 'Equipe não inscrita nesta competição' });
+      // Valida cada confronto
+      if (!equipesPermitidas.includes(cf.equipeA) ||
+        !equipesPermitidas.includes(cf.equipeB))
+        return res.status(400).json({ erro: 'Equipe não classificada nesta competição' });
       if (usados.has(cf.equipeA) || usados.has(cf.equipeB))
         return res.status(400).json({ erro: 'Equipe repetida em dois confrontos' });
       usados.add(cf.equipeA);
@@ -1685,8 +1829,9 @@ app.post('/api/competicoes/:id/montar-chave', auth, bloquearAdminGeral, (req, re
 
     // ---------- Valida cada bye ----------
     for (const b of byes) {
-      if (!equipesInscritas.includes(b))
-        return res.status(400).json({ erro: 'Equipe com bye não inscrita' });
+      // Valida cada bye
+      if (!equipesPermitidas.includes(b))
+        return res.status(400).json({ erro: 'Equipe com bye não classificada' });
       if (usados.has(b))
         return res.status(400).json({ erro: 'Equipe com bye também está num confronto' });
       usados.add(b);
@@ -1733,9 +1878,9 @@ app.post('/api/competicoes/:id/montar-chave', auth, bloquearAdminGeral, (req, re
         }
       });
 
-      // ---------- Rodadas seguintes (vazias), sempre /2 ----------
-      // Q é potência de 2, então essa divisão é sempre exata.
-      let slots = Q;
+      // ---------- Rodadas seguintes (vazias) ----------
+      // Começa com Q/2 slots (numMatchups da rodada 1) e vai dividindo por 2.
+      let slots = Q / 2;
       let rodada = 2;
       while (slots > 1) {
         const slotsProx = slots / 2;
@@ -1786,7 +1931,7 @@ app.put('/api/competicoes/:id/partidas/:pid/vencedor', auth, bloquearAdminGeral,
   const alvo = partidas.find(x => x.id === req.params.pid);
   if (!alvo) return res.status(404).json({ erro: 'Partida não encontrada' });
   // Em competições personalizadas, não propaga automaticamente —
-// o admin escolhe manualmente quem entra em cada confronto.
+  // o admin escolhe manualmente quem entra em cada confronto.
   if (c.tipo === 'personalizado') {
     db.prepare('UPDATE competicoes_partidas SET vencedor=? WHERE id=?')
       .run(String(vencedor || ''), alvo.id);
@@ -1848,18 +1993,18 @@ app.put('/api/competicoes/:id/partidas/:pid/placar', auth, bloquearAdminGeral, (
   const p = db.prepare('SELECT * FROM competicoes_partidas WHERE id = ? AND competicao_id = ?')
     .get(req.params.pid, c.id);
   if (!p) return res.status(404).json({ erro: 'Partida não encontrada' });
-    // Aceita placar em partidas de grupo OU em partidas de bloco tipo 'grupo'
-      // Aceita placar em partidas de grupo, repescagem, ou em partidas de bloco
-    // dos tipos 'grupo' e 'repescagem'
-    // Aceita placar em partidas de grupo OU em partidas de bloco tipo 'grupo'
-    let blocoAceitaPlacar = false;
-if (p.bloco_id) {
-  const bl = db.prepare('SELECT tipo FROM competicoes_blocos WHERE id = ?').get(p.bloco_id);
-  blocoAceitaPlacar = bl && (bl.tipo === 'grupo' || bl.tipo === 'repescagem');
-}
-if (!p.grupo && !blocoAceitaPlacar) {
-  return res.status(400).json({ erro: 'Só é possível lançar placar em partidas de grupo ou repescagem' });
-}
+  // Aceita placar em partidas de grupo OU em partidas de bloco tipo 'grupo'
+  // Aceita placar em partidas de grupo, repescagem, ou em partidas de bloco
+  // dos tipos 'grupo' e 'repescagem'
+  // Aceita placar em partidas de grupo OU em partidas de bloco tipo 'grupo'
+  let blocoAceitaPlacar = false;
+  if (p.bloco_id) {
+    const bl = db.prepare('SELECT tipo FROM competicoes_blocos WHERE id = ?').get(p.bloco_id);
+    blocoAceitaPlacar = bl && (bl.tipo === 'grupo' || bl.tipo === 'repescagem');
+  }
+  if (!p.grupo && !blocoAceitaPlacar) {
+    return res.status(400).json({ erro: 'Só é possível lançar placar em partidas de grupo ou repescagem' });
+  }
 
   const { golsA, golsB } = req.body || {};
   const ga = (golsA === null || golsA === undefined || golsA === '') ? null : Number(golsA);
@@ -2010,6 +2155,7 @@ app.post('/api/competicoes/:id/gerar-mata-mata', auth, bloquearAdminGeral, (req,
   res.json(salvas);
 });
 
+
 // Excluir competição (só responsável, cascade apaga partidas)
 app.delete('/api/competicoes/:id', auth, bloquearAdminGeral, exigirPapel('responsavel'), (req, res) => {
   const c = db.prepare('SELECT * FROM competicoes WHERE id = ?').get(req.params.id);
@@ -2080,66 +2226,66 @@ app.get('/api/classificacao', auth, (req, res) => {
   // Soma pontos das competições (só partidas do mata-mata)
   // Soma pontos das competições
   competicoes.forEach(c => {
-  const pts = db.prepare('SELECT * FROM competicoes_partidas WHERE competicao_id = ?').all(c.id).map(mapPartida);
+    const pts = db.prepare('SELECT * FROM competicoes_partidas WHERE competicao_id = ?').all(c.id).map(mapPartida);
 
-  // -------- Personalizado: usa os blocos "eh_final" e "eh_terceiro" --------
-  if (c.tipo === 'personalizado') {
-    const blocos = db.prepare('SELECT * FROM competicoes_blocos WHERE competicao_id = ?').all(c.id);
-    const blocoFinal = blocos.find(b => b.eh_final);
-    const blocoTerceiro = blocos.find(b => b.eh_terceiro);
+    // -------- Personalizado: usa os blocos "eh_final" e "eh_terceiro" --------
+    if (c.tipo === 'personalizado') {
+      const blocos = db.prepare('SELECT * FROM competicoes_blocos WHERE competicao_id = ?').all(c.id);
+      const blocoFinal = blocos.find(b => b.eh_final);
+      const blocoTerceiro = blocos.find(b => b.eh_terceiro);
 
-    if (blocoFinal) {
-      const finais = pts
-        .filter(p => p.blocoId === blocoFinal.id && p.vencedor && p.equipeA && p.equipeB)
-        .sort((a, b) => (b.posicao || 0) - (a.posicao || 0));
-      const final = finais[0];
-      if (final) {
-        const perd = final.vencedor === final.equipeA ? final.equipeB : final.equipeA;
-        const v = mapa.get(final.vencedor);
-        const p2 = mapa.get(perd);
-        if (v) { v.pontos += Number(c.pontos_1) || 0; v.jogos++; }
-        if (p2) { p2.pontos += Number(c.pontos_2) || 0; p2.jogos++; }
+      if (blocoFinal) {
+        const finais = pts
+          .filter(p => p.blocoId === blocoFinal.id && p.vencedor && p.equipeA && p.equipeB)
+          .sort((a, b) => (b.posicao || 0) - (a.posicao || 0));
+        const final = finais[0];
+        if (final) {
+          const perd = final.vencedor === final.equipeA ? final.equipeB : final.equipeA;
+          const v = mapa.get(final.vencedor);
+          const p2 = mapa.get(perd);
+          if (v) { v.pontos += Number(c.pontos_1) || 0; v.jogos++; }
+          if (p2) { p2.pontos += Number(c.pontos_2) || 0; p2.jogos++; }
+        }
       }
-    }
-    const cfgLocal = (() => { try { return JSON.parse(c.config_json || '{}'); } catch { return {}; } })();
-    if (cfgLocal.terceiroColocado) {
-      const t3 = mapa.get(cfgLocal.terceiroColocado);
-      if (t3) { t3.pontos += Number(c.pontos_3) || 0; t3.jogos++; }
-    } else if (blocoTerceiro) {
-      const terceiros = pts
-        .filter(p => p.blocoId === blocoTerceiro.id && p.vencedor)
-        .sort((a, b) => (b.posicao || 0) - (a.posicao || 0));
-      const terc = terceiros[0];
-      if (terc) {
-        const t3 = mapa.get(terc.vencedor);
+      const cfgLocal = (() => { try { return JSON.parse(c.config_json || '{}'); } catch { return {}; } })();
+      if (cfgLocal.terceiroColocado) {
+        const t3 = mapa.get(cfgLocal.terceiroColocado);
         if (t3) { t3.pontos += Number(c.pontos_3) || 0; t3.jogos++; }
+      } else if (blocoTerceiro) {
+        const terceiros = pts
+          .filter(p => p.blocoId === blocoTerceiro.id && p.vencedor)
+          .sort((a, b) => (b.posicao || 0) - (a.posicao || 0));
+        const terc = terceiros[0];
+        if (terc) {
+          const t3 = mapa.get(terc.vencedor);
+          if (t3) { t3.pontos += Number(c.pontos_3) || 0; t3.jogos++; }
+        }
       }
+
+      return; // não usa a lógica antiga
     }
 
-    return; // não usa a lógica antiga
-  }
-
-  // -------- Mata-mata e grupos + mata-mata: lógica antiga --------
-  const principais = pts.filter(p => !p.isTerceiro && !p.grupo);
-  const terc = pts.find(p => p.isTerceiro && !p.grupo);
-  const maxR = principais.length ? Math.max(...principais.map(p => p.rodada)) : 0;
-  const final = principais.find(p => p.rodada === maxR && p.vencedor && p.equipeA && p.equipeB);
-  if (final) {
-    const perd = final.vencedor === final.equipeA ? final.equipeB : final.equipeA;
-    const v = mapa.get(final.vencedor);
-    const p2 = mapa.get(perd);
-    if (v) { v.pontos += Number(c.pontos_1) || 0; v.jogos++; }
-    if (p2) { p2.pontos += Number(c.pontos_2) || 0; p2.jogos++; }
-  }
-  // NOVO — 3º definido manualmente no config
-  const cfgComp = (() => { try { return JSON.parse(c.config_json || '{}'); } catch { return {}; } })();
-  if (cfgComp.terceiroColocado) {
-    const t3 = mapa.get(cfgComp.terceiroColocado);
-    if (t3) { t3.pontos += Number(c.pontos_3) || 0; t3.jogos++; }
-  } else if (terc && terc.vencedor) {
-    const t3 = mapa.get(terc.vencedor);
-    if (t3) { t3.pontos += Number(c.pontos_3) || 0; t3.jogos++; }
-  }
+    // -------- Mata-mata e grupos + mata-mata: lógica antiga --------
+    const principais = pts.filter(p => !p.isTerceiro && !p.grupo);
+    const terc = pts.find(p => p.isTerceiro && !p.grupo);
+    const maxR = principais.length ? Math.max(...principais.map(p => p.rodada)) : 0;
+    const final = principais.find(p => p.rodada === maxR && p.vencedor && p.equipeA && p.equipeB);
+    if (final) {
+      const perd = final.vencedor === final.equipeA ? final.equipeB : final.equipeA;
+      const v = mapa.get(final.vencedor);
+      const p2 = mapa.get(perd);
+      if (v) { v.pontos += Number(c.pontos_1) || 0; v.jogos++; }
+      if (p2) { p2.pontos += Number(c.pontos_2) || 0; p2.jogos++; }
+    }
+    // NOVO — 3º definido manualmente no config
+    const cfgComp = (() => { try { return JSON.parse(c.config_json || '{}'); } catch { return {}; } })();
+    if (cfgComp.terceiroColocado) {
+      const t3 = mapa.get(cfgComp.terceiroColocado);
+      if (t3) { t3.pontos += Number(c.pontos_3) || 0; t3.jogos++; }
+    } else if (terc && terc.vencedor) {
+      const t3 = mapa.get(terc.vencedor);
+      if (t3) { t3.pontos += Number(c.pontos_3) || 0; t3.jogos++; }
+    }
   });
 
   // Subtrai penalidades
@@ -2164,7 +2310,7 @@ app.get('/api/classificacao', auth, (req, res) => {
 
 function mapBloco(row) {
   let cfg = {};
-  try { cfg = JSON.parse(row.config_json || '{}'); } catch {}
+  try { cfg = JSON.parse(row.config_json || '{}'); } catch { }
   return {
     id: row.id,
     competicaoId: row.competicao_id,
@@ -2189,9 +2335,9 @@ app.post('/api/competicoes/:id/blocos', auth, bloquearAdminGeral, (req, res) => 
   const { nome, tipo } = req.body || {};
   if (!nome || !nome.trim()) return res.status(400).json({ erro: 'Nome do bloco é obrigatório' });
   const tipoFinal =
-  tipo === 'grupo'      ? 'grupo' :
-  tipo === 'repescagem' ? 'repescagem' :
-                          'eliminatoria';
+    tipo === 'grupo' ? 'grupo' :
+      tipo === 'repescagem' ? 'repescagem' :
+        'eliminatoria';
   const id = uid();
 
   // Coloca no final da ordem
@@ -2214,7 +2360,7 @@ app.put('/api/competicoes/:id/blocos/:bid', auth, bloquearAdminGeral, (req, res)
   const { nome, tipo, ehFinal, ehTerceiro, config } = req.body || {};
   const nomeFinal = nome && nome.trim() ? nome.trim() : b.nome;
   const tipoFinal =
-  (tipo === 'grupo' || tipo === 'eliminatoria' || tipo === 'repescagem') ? tipo : b.tipo;
+    (tipo === 'grupo' || tipo === 'eliminatoria' || tipo === 'repescagem') ? tipo : b.tipo;
 
   db.prepare(`UPDATE competicoes_blocos
               SET nome=?, tipo=?, eh_final=?, eh_terceiro=?, config_json=?
@@ -2401,9 +2547,10 @@ app.put('/api/competicoes/:id/partidas/:pid', auth, bloquearAdminGeral, (req, re
   const p = db.prepare('SELECT * FROM competicoes_partidas WHERE id = ? AND competicao_id = ?').get(req.params.pid, c.id);
   if (!p) return res.status(404).json({ erro: 'Partida não encontrada' });
 
-  const { equipeA, equipeB } = req.body || {};
+  const { equipeA, equipeB, horario } = req.body || {};
   const a = equipeA === undefined ? p.equipe_a : equipeA;
   const b = equipeB === undefined ? p.equipe_b : equipeB;
+  const h = horario === undefined ? (p.horario || '') : String(horario || '');
 
   // Limpa vencedor se a equipe mudou
   let venc = p.vencedor;
@@ -2411,8 +2558,8 @@ app.put('/api/competicoes/:id/partidas/:pid', auth, bloquearAdminGeral, (req, re
     venc = '';
   }
 
-  db.prepare('UPDATE competicoes_partidas SET equipe_a=?, equipe_b=?, vencedor=? WHERE id=?')
-    .run(a, b, venc, p.id);
+  db.prepare('UPDATE competicoes_partidas SET equipe_a=?, equipe_b=?, vencedor=?, horario=? WHERE id=?')
+    .run(a, b, venc, h, p.id);
 
   res.json(mapPartida(db.prepare('SELECT * FROM competicoes_partidas WHERE id = ?').get(p.id)));
 });
@@ -2441,7 +2588,7 @@ function classificarBloco(partidas, cfg) {
 
   const mapa = new Map();
   Array.from(idsSet).forEach(eid =>
-    mapa.set(eid, { id: eid, P:0, V:0, E:0, D:0, GP:0, GC:0, SG:0, PTS:0 })
+    mapa.set(eid, { id: eid, P: 0, V: 0, E: 0, D: 0, GP: 0, GC: 0, SG: 0, PTS: 0 })
   );
 
   partidas.forEach(p => {
@@ -2567,5 +2714,5 @@ app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.ht
 // (necessário para funcionar dentro de containers).
 // ============================================================
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🌱 CompAct Jr. rodando em http://0.0.0.0:${PORT}`);
+  console.log(`CompAct Jr. rodando em http://0.0.0.0:${PORT}`);
 });
