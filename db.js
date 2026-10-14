@@ -1,46 +1,46 @@
-  // ============================================================
-  // db.js — Conexão com SQLite + schema + migrações
-  // ------------------------------------------------------------
-  // Este arquivo é importado pelo server.js.
-  // Ele:
-  //   1. Abre (ou cria) o arquivo do banco
-  //   2. Cria as tabelas se não existirem
-  //   3. Aplica migrações de colunas em bancos antigos
-  //   4. Cria o usuário admin padrão na primeira execução
-  // ============================================================
+// ============================================================
+// db.js — Conexão com SQLite + schema + migrações
+// ------------------------------------------------------------
+// Este arquivo é importado pelo server.js.
+// Ele:
+//   1. Abre (ou cria) o arquivo do banco
+//   2. Cria as tabelas se não existirem
+//   3. Aplica migrações de colunas em bancos antigos
+//   4. Cria o usuário admin padrão na primeira execução
+// ============================================================
 
-  const Database = require('better-sqlite3');
-  const path = require('path');
-  const fs = require('fs');
-  const bcrypt = require('bcryptjs');
+const Database = require('better-sqlite3');
+const path = require('path');
+const fs = require('fs');
+const bcrypt = require('bcryptjs');
 
-  // ------------------------------------------------------------
-  // Onde o banco é gravado
-  // ------------------------------------------------------------
-  // Em produção (Fly.io), DATA_DIR = "/data" (volume persistente).
-  // Em desenvolvimento, DATA_DIR = "./data" (pasta local).
-  // ------------------------------------------------------------
-  const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+// ------------------------------------------------------------
+// Onde o banco é gravado
+// ------------------------------------------------------------
+// Em produção (Fly.io), DATA_DIR = "/data" (volume persistente).
+// Em desenvolvimento, DATA_DIR = "./data" (pasta local).
+// ------------------------------------------------------------
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 
-  // Cria a pasta se não existir
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+// Cria a pasta se não existir
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-  // Abre (ou cria) o arquivo do banco
-  const db = new Database(path.join(DATA_DIR, 'compactjr.db'));
+// Abre (ou cria) o arquivo do banco
+const db = new Database(path.join(DATA_DIR, 'compactjr.db'));
 
-  // WAL = Write-Ahead Logging (melhor performance para leitura/escrita concorrente)
-  db.pragma('journal_mode = WAL');
+// WAL = Write-Ahead Logging (melhor performance para leitura/escrita concorrente)
+db.pragma('journal_mode = WAL');
 
-  // Ativa as foreign keys (SQLite vem com elas desativadas por padrão)
-  db.pragma('foreign_keys = ON');
+// Ativa as foreign keys (SQLite vem com elas desativadas por padrão)
+db.pragma('foreign_keys = ON');
 
-  // ============================================================
-  // SCHEMA — Criação inicial das tabelas
-  // ------------------------------------------------------------
-  // Todos os comandos usam IF NOT EXISTS, então rodar isso em um
-  // banco já existente não causa erro nem perda de dados.
-  // ============================================================
-  db.exec(`
+// ============================================================
+// SCHEMA — Criação inicial das tabelas
+// ------------------------------------------------------------
+// Todos os comandos usam IF NOT EXISTS, então rodar isso em um
+// banco já existente não causa erro nem perda de dados.
+// ============================================================
+db.exec(`
     -- Organizações (clientes do sistema)
     CREATE TABLE IF NOT EXISTS organizacoes (
       id TEXT PRIMARY KEY,
@@ -164,24 +164,24 @@
     CREATE INDEX IF NOT EXISTS idx_auditoria_criado ON auditoria(criado_em);
   `);
 
-  // ============================================================
-  // MIGRAÇÕES DE COLUNAS
-  // ------------------------------------------------------------
-  // Quando adicionamos uma coluna nova numa tabela já existente,
-  // usamos ALTER TABLE. Mas o SQLite lança erro se a coluna já
-  // existir, então precisamos checar antes com PRAGMA table_info.
-  //
-  // A função addColuna() faz isso de forma segura.
-  // ============================================================
-  function addColuna(tabela, coluna, definicao) {
-    const cols = db.prepare(`PRAGMA table_info(${tabela})`).all().map(c => c.name);
-    if (!cols.includes(coluna)) {
-      db.exec(`ALTER TABLE ${tabela} ADD COLUMN ${coluna} ${definicao}`);
-      console.log(`🔧 Migração: ${tabela}.${coluna} adicionada`);
-    }
+// ============================================================
+// MIGRAÇÕES DE COLUNAS
+// ------------------------------------------------------------
+// Quando adicionamos uma coluna nova numa tabela já existente,
+// usamos ALTER TABLE. Mas o SQLite lança erro se a coluna já
+// existir, então precisamos checar antes com PRAGMA table_info.
+//
+// A função addColuna() faz isso de forma segura.
+// ============================================================
+function addColuna(tabela, coluna, definicao) {
+  const cols = db.prepare(`PRAGMA table_info(${tabela})`).all().map(c => c.name);
+  if (!cols.includes(coluna)) {
+    db.exec(`ALTER TABLE ${tabela} ADD COLUMN ${coluna} ${definicao}`);
+    console.log(`🔧 Migração: ${tabela}.${coluna} adicionada`);
   }
+}
 
-  // Blocos de competições personalizadas (tipo='personalizado')
+// Blocos de competições personalizadas (tipo='personalizado')
 // Cada bloco é um "grupo" ou uma "fase eliminatória" com nome livre.
 db.exec(`
   CREATE TABLE IF NOT EXISTS competicoes_blocos (
@@ -201,33 +201,36 @@ db.exec(`
 // Vincula cada partida a um bloco (quando for personalizado)
 addColuna('competicoes_partidas', 'bloco_id', "TEXT DEFAULT ''");
 
-  // Aplica as migrações conhecidas (seguro de rodar várias vezes)
-  addColuna('organizacoes', 'imagem', "TEXT DEFAULT ''");
-  addColuna('organizacoes', 'mostrar_subs_classificacao', "INTEGER DEFAULT 1");
-  addColuna('competicoes', 'config_json', "TEXT DEFAULT '{}'");
-  addColuna('competicoes_partidas', 'grupo', "TEXT DEFAULT ''");
-  addColuna('competicoes_partidas', 'gols_a', "INTEGER");
-  addColuna('competicoes_partidas', 'gols_b', "INTEGER");
-  addColuna('equipes', 'equipe_pai_id', "TEXT DEFAULT ''");
+// Aplica as migrações conhecidas (seguro de rodar várias vezes)
+addColuna('organizacoes', 'imagem', "TEXT DEFAULT ''");
+addColuna('organizacoes', 'mostrar_subs_classificacao', "INTEGER DEFAULT 1");
+addColuna('competicoes', 'config_json', "TEXT DEFAULT '{}'");
+addColuna('competicoes_partidas', 'grupo', "TEXT DEFAULT ''");
+addColuna('competicoes_partidas', 'gols_a', "INTEGER");
+addColuna('competicoes_partidas', 'gols_b', "INTEGER");
+addColuna('equipes', 'equipe_pai_id', "TEXT DEFAULT ''");
+addColuna('organizacoes', 'modo_publico', "TEXT DEFAULT 'competicoes_classificacao_com_pts'");
+addColuna('organizacoes', 'esconder_pontos_podio', "INTEGER DEFAULT 0");
+addColuna('competicoes_partidas', 'horario', "TEXT DEFAULT ''");
 
-  // ============================================================
-  // SEED DO ADMIN GERAL
-  // ------------------------------------------------------------
-  // Na primeira execução (banco vazio), cria o usuário admin.
-  // Se já existir um admin_geral, não faz nada.
-  //
-  // Em produção, defina ADMIN_USER e ADMIN_PASS via secrets para
-  // não usar a senha padrão insegura.
-  // ============================================================
-  const adminExiste = db.prepare("SELECT id FROM usuarios WHERE papel='admin_geral' LIMIT 1").get();
-  if (!adminExiste) {
-    const u = process.env.ADMIN_USER || 'admin';
-    const p = process.env.ADMIN_PASS || 'admin123';
-    const hash = bcrypt.hashSync(p, 10); // custo 10 é o padrão seguro
-    db.prepare(`INSERT INTO usuarios (org_id, usuario, senha_hash, nome, papel)
+// ============================================================
+// SEED DO ADMIN GERAL
+// ------------------------------------------------------------
+// Na primeira execução (banco vazio), cria o usuário admin.
+// Se já existir um admin_geral, não faz nada.
+//
+// Em produção, defina ADMIN_USER e ADMIN_PASS via secrets para
+// não usar a senha padrão insegura.
+// ============================================================
+const adminExiste = db.prepare("SELECT id FROM usuarios WHERE papel='admin_geral' LIMIT 1").get();
+if (!adminExiste) {
+  const u = process.env.ADMIN_USER || 'admin';
+  const p = process.env.ADMIN_PASS || 'admin123';
+  const hash = bcrypt.hashSync(p, 10); // custo 10 é o padrão seguro
+  db.prepare(`INSERT INTO usuarios (org_id, usuario, senha_hash, nome, papel)
                 VALUES (NULL, ?, ?, ?, 'admin_geral')`).run(u, hash, 'Administrador Geral');
-    console.log(`👤 Admin geral criado: ${u} / ${p}`);
-  }
+  console.log(`👤 Admin geral criado: ${u} / ${p}`);
+}
 
-  // Exporta a conexão para o resto do projeto
-  module.exports = db;
+// Exporta a conexão para o resto do projeto
+module.exports = db;
